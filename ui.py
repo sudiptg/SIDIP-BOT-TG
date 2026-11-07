@@ -17,6 +17,12 @@ def _onoff(value: bool):
     return ("ON", "success") if value else ("OFF", "danger")
 
 
+def _db_label() -> str:
+    if config.IS_RENDER and db.backend == "json":
+        return "json ⚠️ temporary - set MONGO_URI"
+    return db.backend
+
+
 def _fmt(uid) -> str:
     return db.user(uid)["rename_format"] or config.DEFAULT_RENAME_FORMAT
 
@@ -222,10 +228,11 @@ def metadata_panel(uid):
     text = (
         "🏷 <b>Metadata Engine</b>\n"
         f"<blockquote>{chr(10).join(lines)}</blockquote>\n"
-        "<i>'Change All' fills every tag that has no value of its own.</i>"
+        "<i>'Change All' fills every tag that has no value of its own. 'Set Multiple' saves many tags in one message. "
+        "MKV keeps every tag; MP4 switches to extended tags automatically when needed.</i>"
     )
     label, style = _onoff(enabled)
-    rows = [[btn(f"🏷 Metadata: {label}", "m:toggle", style)], [btn("🔄 Change All", "m:edit:all", "success")]]
+    rows = [[btn(f"🏷 Metadata: {label}", "m:toggle", style)], [btn("🔄 Change All", "m:edit:all", "success"), btn("📋 Set Multiple", "m:bulk", "success")]]
     fields = [btn(f"{emoji} {name}", f"m:edit:{key}", "primary") for key, name, emoji in config.METADATA_FIELDS]
     rows += [fields[i:i + 2] for i in range(0, len(fields), 2)]
     rows.append([btn("🧹 Reset All", "m:reset", "danger"), btn("⚙️ Settings", "s:main")])
@@ -260,7 +267,7 @@ def admin_panel():
         "🛠 <b>Admin Panel</b>\n"
         f"<blockquote>👥 <b>Users:</b> {users}   🔐 <b>Authorized:</b> {len(auth) + len(config.AUTH_USERS)}\n"
         f"⚙️ <b>Parallel tasks:</b> {limiter.limit}   🏃 <b>Running:</b> {limiter.active}\n"
-        f"💾 <b>Database:</b> {db.backend}   🌐 <b>Host:</b> {esc(config.PLATFORM)}</blockquote>\n"
+        f"💾 <b>Database:</b> {_db_label()}   🌐 <b>Host:</b> {esc(config.PLATFORM)}</blockquote>\n"
         "<i>Tap a number below to change parallel tasks. Manage access with</i> "
         "<code>/auth id</code> <i>and</i> <code>/unauth id</code>"
     )
@@ -276,6 +283,51 @@ def admin_panel():
     return text, kb(rows)
 
 
+def _read_int(path: str):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _stat_value(path: str, key: str) -> int:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                name, _, value = line.partition(" ")
+                if name == key:
+                    return int(value)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _container_memory():
+    """Return (used, limit) bytes of THIS container (cgroup v2 / v1), or None when unlimited.
+
+    psutil would show the whole host machine, which is misleading on Render / Docker.
+    Page cache is excluded, like ``docker stats`` does.
+    """
+    layouts = (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.stat", "inactive_file"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+         "/sys/fs/cgroup/memory/memory.stat", "total_inactive_file"),
+    )
+    for limit_path, used_path, stat_path, cache_key in layouts:
+        limit, used = _read_int(limit_path), _read_int(used_path)  # "max" -> None (no limit)
+        if limit and used is not None and limit < (1 << 50):
+            return max(0, used - _stat_value(stat_path, cache_key)), limit
+    return None
+
+
+def _folder_size(folder) -> int:
+    try:
+        return sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
+    except OSError:
+        return 0
+
+
 def stats_panel():
     stats = db.data["global"]["stats"]
     lines = [
@@ -284,17 +336,21 @@ def stats_panel():
         f"📤 <b>Processed:</b> {format_bytes(stats['bytes'])}",
         f"🏃 <b>Active:</b> {len(TASKS)}   👥 <b>Users:</b> {len(db.data['users'])}",
     ]
-    try:
-        import psutil
+    memory = _container_memory()
+    if memory:
+        used, limit = memory
+        lines.append(f"🧠 <b>RAM:</b> {format_bytes(used)} / {format_bytes(limit)} ({used * 100 / limit:.0f}%)")
+    else:
+        try:
+            import psutil
 
-        lines.append(f"🖥 <b>CPU:</b> {psutil.cpu_percent(interval=None):.0f}%   "
-                     f"🧠 <b>RAM:</b> {psutil.virtual_memory().percent:.0f}%")
-    except Exception:
-        pass
-    disk = shutil.disk_usage(str(config.DOWNLOAD_DIR))
-    lines.append(f"💽 <b>Disk:</b> {format_bytes(disk.used)} / {format_bytes(disk.total)}")
+            lines.append(f"🧠 <b>RAM:</b> {psutil.virtual_memory().percent:.0f}% (host)")
+        except Exception:
+            pass
+    lines.append(f"💽 <b>Temp files:</b> {format_bytes(_folder_size(config.DOWNLOAD_DIR))}   "
+                 f"free disk: {format_bytes(shutil.disk_usage(str(config.DOWNLOAD_DIR)).free)}")
     lines += [
-        f"💾 <b>Database:</b> {db.backend}",
+        f"💾 <b>Database:</b> {_db_label()}",
         f"🌐 <b>Host:</b> {esc(config.PLATFORM)}   🎨 <b>Buttons:</b> {'native' if 'native' in COLOR_MODE else 'emoji'}",
         f"🔖 <b>Version:</b> {config.VERSION}   🐍 PID {os.getpid()}",
     ]
