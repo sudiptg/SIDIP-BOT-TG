@@ -394,32 +394,78 @@ def _clean(value) -> str:
     return str(value).replace("\n", " ").strip() if value else ""
 
 
-def build_metadata_args(meta: dict, fallback_title: str) -> list:
+_GLOBAL_TAGS = (
+    ("desc", "description"), ("artist", "artist"), ("album", "album"), ("author", "author"),
+    ("official", "OFFICIAL_SITE"), ("copyright", "copyright"), ("publisher", "publisher"),
+    ("genre", "genre"), ("encodedby", "encoded_by"), ("comment", "comment"),
+)
+# MP4 can only store these natively; the others need the extended "mdta" tag format.
+_MP4_EXTENDED_ONLY = ("author", "official", "publisher", "encodedby")
+
+
+def resolve_metadata(meta: dict, fallback_title: str) -> dict:
+    """Merge per-field values with 'Change All'. Only non-empty values are returned."""
     change_all = _clean(meta.get("all"))
+    values = {key: _clean(meta.get(key)) or change_all for key, _, _ in config.METADATA_FIELDS}
+    values["title"] = _clean(meta.get("title")) or change_all or fallback_title
+    return {key: value for key, value in values.items() if value}
 
-    def pick(key: str) -> str:
-        return _clean(meta.get(key)) or change_all
 
-    title = _clean(meta.get("title")) or change_all or fallback_title
-    args = ["-metadata", f"title={title}", "-metadata:s:v:0", f"title={title}"]
-    for key, tag in (("desc", "description"), ("artist", "artist"), ("album", "album"), ("author", "author"),
-                     ("official", "OFFICIAL_SITE"), ("copyright", "copyright"), ("publisher", "publisher"),
-                     ("genre", "genre"), ("encodedby", "encoded_by"), ("comment", "comment"),
-                     ("encoder", "encoder")):
-        if pick(key):
-            args += ["-metadata", f"{tag}={pick(key)}"]
-    if pick("year"):
-        args += ["-metadata", f"date={pick('year')}", "-metadata", f"year={pick('year')}"]
-    if pick("audiotitle"):
-        args += ["-metadata:s:a", f"title={pick('audiotitle')}"]
-    if pick("subtitle"):
-        args += ["-metadata:s:s", f"title={pick('subtitle')}"]
+def build_metadata_args(values: dict, is_mp4: bool = False) -> list:
+    args = ["-metadata", f"title={values['title']}"]
+    for key, tag in _GLOBAL_TAGS:
+        if key in values:
+            args += ["-metadata", f"{tag}={values[key]}"]
+    if "year" in values:
+        args += ["-metadata", f"date={values['year']}", "-metadata", f"year={values['year']}"]
+
+    def track_title(selector: str, text: str) -> None:
+        args.extend([f"-metadata:s:{selector}", f"title={text}"])
+        if is_mp4:  # MP4 stores track names in handler_name
+            args.extend([f"-metadata:s:{selector}", f"handler_name={text}"])
+
+    track_title("v:0", values["title"])
+    if "audiotitle" in values:
+        track_title("a", values["audiotitle"])
+    if "subtitle" in values:
+        track_title("s", values["subtitle"])
+    if "encoder" in values:
+        # The muxer always overwrites the global 'encoder' tag, so it is written per stream as well.
+        args += ["-metadata", f"encoder={values['encoder']}", "-metadata:s", f"encoder={values['encoder']}"]
+    if is_mp4 and any(key in values for key in _MP4_EXTENDED_ONLY):
+        args += ["-movflags", "+use_metadata_tags"]
     return args
+
+
+_BULK_ALIASES = {"all": "all", "changeall": "all", "description": "desc", "site": "official",
+                 "website": "official", "audio": "audiotitle", "sub": "subtitle", "subtitletitle": "subtitle"}
+
+
+def parse_bulk_metadata(text: str):
+    """Parse ``key: value`` lines. Returns ``(values, unknown_keys)``; a value of None means 'clear'."""
+    aliases = dict(_BULK_ALIASES)
+    for key, label, _ in config.METADATA_FIELDS:
+        aliases[key] = key
+        aliases[re.sub(r"[^a-z]", "", label.lower())] = key
+    values, unknown = {}, []
+    for line in text.splitlines():
+        match = re.match(r"^\s*([^:=]+?)\s*[:=]\s*(.*?)\s*$", line)
+        if not match:
+            continue
+        raw_key, value = match.groups()
+        field = aliases.get(re.sub(r"[^a-z]", "", raw_key.lower()))
+        if not field:
+            unknown.append(raw_key.strip())
+        elif value:
+            values[field] = None if value == "-" else value[:200]
+    return values, unknown
 
 
 async def process_media(task: Task, src: Path, dst: Path, info: dict, settings: dict, meta: dict) -> bool:
     """Remux ``src`` -> ``dst`` (stream copy) applying audio/subtitle filters and metadata.
 
+    Several strategies are tried before giving up, so metadata is applied reliably:
+      1. everything (subtitles + attachments)  2. without subtitles  3. MP4 only: audio -> AAC.
     Returns False when ffmpeg could not handle the file (caller then keeps the original bytes).
     """
     streams = info["streams"]
@@ -431,31 +477,44 @@ async def process_media(task: Task, src: Path, dst: Path, info: dict, settings: 
         chosen = matched or audio  # never drop every audio track when the language is missing
     wants_subs = bool(settings["sub"]) and any(s["type"] == "subtitle" for s in streams)
     is_mp4 = dst.suffix.lower() in config.MP4_FAMILY
-    metadata = build_metadata_args(meta, dst.stem) if settings["meta_enabled"] else []
+    metadata = []
+    if settings["meta_enabled"]:
+        metadata = build_metadata_args(resolve_metadata(meta, dst.stem), is_mp4)
 
-    for with_subs in ([True, False] if wants_subs else [False]):
-        cmd = ["ffmpeg", "-y", "-i", src, "-map", "0:v?"]
+    plans = [(True, False)] if wants_subs else []     # (with_subs, audio_to_aac)
+    plans.append((False, False))
+    if is_mp4 and audio:
+        plans.append((False, True))
+
+    for with_subs, to_aac in plans:
+        cmd = ["ffmpeg", "-nostdin", "-y", "-i", src, "-map", "0:v?"]
         for stream in chosen:
             cmd += ["-map", f"0:{stream['index']}"]
         if with_subs:
             cmd += ["-map", "0:s?"]
-        if dst.suffix.lower() == ".mkv":
+        if dst.suffix.lower() == ".mkv" and with_subs:
             cmd += ["-map", "0:t?"]  # keep attached fonts (ASS subtitles)
+        cmd += ["-dn"] if not with_subs else []
         cmd += metadata + ["-c", "copy"]
+        if to_aac:
+            cmd += ["-c:a", "aac", "-b:a", "192k"]
         if with_subs and is_mp4:
             cmd += ["-c:s", "mov_text"]
         cmd.append(dst)
         code, _, err = await run_cmd(*cmd, task=task)
         task.check()
         if code == 0 and dst.exists() and dst.stat().st_size > 0:
+            if to_aac:
+                task.notes.append("Audio was converted to AAC because the original codec can not be stored in MP4.")
             return True
-        log.warning("ffmpeg failed (subs=%s): %s", with_subs, err.decode(errors="ignore")[-300:])
+        log.warning("ffmpeg failed (subs=%s, aac=%s): %s", with_subs, to_aac, err.decode(errors="ignore")[-300:])
+        dst.unlink(missing_ok=True)
     return False
 
 
 async def make_thumbnail(src: Path, dst: Path, at: int = None):
     """Create a Telegram-friendly JPEG thumbnail (max 320 px) from a video or an image."""
-    cmd = ["ffmpeg", "-y"]
+    cmd = ["ffmpeg", "-nostdin", "-y"]
     if at is not None:
         cmd += ["-ss", str(at)]
     cmd += ["-i", src, "-vframes", "1", "-vf", "scale='min(320,iw)':-2", "-q:v", "5", dst]
