@@ -34,6 +34,7 @@ class Task:
     last_edit: float = 0.0
     cancelled: bool = False
     proc: object = None  # running subprocess (aria2c / ffmpeg), if any
+    notes: list = field(default_factory=list)  # warnings shown to the user after upload
 
     @property
     def task_id(self) -> str:
