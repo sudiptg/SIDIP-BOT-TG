@@ -341,6 +341,9 @@ async def process_task(client, message, original_name, url=None, media=None, cus
                 source.unlink(missing_ok=True)
             else:  # not a media file (or ffmpeg refused it): rename only, keep original bytes
                 shutil.move(str(source), str(final))
+                if is_media:
+                    task.notes.append("Metadata / audio / subtitle settings could NOT be applied "
+                                      "(ffmpeg could not process this file). It was only renamed.")
             task.check()
             info = info or {"duration": 0, "width": 0, "height": 0, "has_video": False}
 
@@ -385,6 +388,11 @@ async def process_task(client, message, original_name, url=None, media=None, cus
             await task.status_msg.delete()
         except Exception:
             pass
+        if task.notes:
+            try:
+                await sent.reply("⚠️ <b>Note</b>\n<blockquote>" + "\n".join(esc(n) for n in task.notes) + "</blockquote>")
+            except Exception:
+                pass
         if settings["delete_source"] and media is not None:
             try:
                 await message.delete()
@@ -426,7 +434,22 @@ async def text_input(client, message):
     st, user = db.settings(uid), db.user(uid)
     rollback = None
 
-    if action.startswith("meta:"):
+    notice = ""
+    if action == "metabulk":
+        values, unknown = tools.parse_bulk_metadata(message.text)
+        if not values:
+            input_state[uid] = {**state, "expires": time.time() + INPUT_TTL}  # let the user retry
+            return await message.reply("⚠️ <b>No valid line found.</b>\nUse one tag per line, for example:\n"
+                                       "<code>title: My Show\nartist: FlyTon</code>")
+        for key, val in values.items():
+            if val is None:
+                user["metadata"].pop(key, None)
+            else:
+                user["metadata"][key] = val
+        if unknown:
+            notice = "⚠️ <b>Ignored unknown keys:</b> " + ", ".join(f"<code>{esc(k)}</code>" for k in unknown[:10])
+        builder = ui.metadata_panel
+    elif action.startswith("meta:"):
         key = action.split(":", 1)[1]
         if clear:
             user["metadata"].pop(key, None)
@@ -455,6 +478,8 @@ async def text_input(client, message):
     try:
         text, markup = builder(uid)
         await client.edit_message_text(state["chat_id"], state["msg_id"], text, reply_markup=markup)
+        if notice:
+            await client.send_message(state["chat_id"], notice)
     except MessageNotModified:
         pass
     except Exception as exc:
@@ -622,6 +647,12 @@ async def route_callback(client, cq, uid, parts):
             current = user["metadata"].get(arg)
             await ask(cq, uid, f"meta:{arg}", label,
                       f"Current: <code>{esc(current)}</code>" if current else "Current: <i>not set</i>", "m:open")
+        elif action == "bulk":
+            await ask(cq, uid, "metabulk", "Set Multiple Tags",
+                      "One tag per line:\n<code>title: My Show\nartist: FlyTon\nyear: 2024</code>\n"
+                      "<b>Keys:</b> all, title, desc, artist, album, year, author, official, copyright, "
+                      "publisher, genre, encodedby, comment, encoder, audiotitle, subtitle\n"
+                      "Use <code>key: -</code> to clear a tag.", "m:open")
         elif action == "reset":
             if arg == "yes":
                 user["metadata"] = {}
@@ -714,11 +745,15 @@ async def main() -> None:
     except Exception as exc:
         log.warning("Could not set bot commands: %s", exc)
     if config.NOTIFY_OWNER_ON_START:
+        warning = ""
+        if config.IS_RENDER and db.backend == "json":
+            warning = ("\n\n⚠️ <b>Database is temporary!</b> Render wipes the disk on every restart, so your "
+                       "settings and metadata will be lost. Add the <code>MONGO_URI</code> variable.")
         try:
             await app.send_message(
                 config.OWNER_ID,
                 f"✅ <b>{esc(config.BOT_NAME)} is online!</b>\n<blockquote>🌐 {esc(config.PLATFORM)}\n"
-                f"💾 Database: {db.backend}\n🎨 {COLOR_MODE}</blockquote>")
+                f"💾 Database: {db.backend}\n🎨 {COLOR_MODE}</blockquote>{warning}")
         except Exception as exc:
             log.info("Owner start notification skipped: %s", exc)
 
