@@ -1,0 +1,8 @@
+# NOTE: pyrotgfork supports native coloured buttons (Bot API 9.4+).
+# It replaces pyrofork (both provide the "pyrogram" module, so never install both together).
+# If you prefer pyrofork, swap the name below - the bot falls back to coloured emoji dots automatically.
+pyrotgfork
+tgcrypto
+aiohttp
+psutil
+pymongo>=4.13
