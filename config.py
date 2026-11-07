@@ -94,7 +94,8 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "autorename_bot")
 # --------------------------------------------------------------------------- #
 HOST = "0.0.0.0"
 PORT = _int("PORT", 8080)  # Render injects PORT (default 10000)
-PLATFORM = "Render" if os.getenv("RENDER") else "Self-hosted (VPS / Docker)"
+IS_RENDER = bool(os.getenv("RENDER"))
+PLATFORM = "Render" if IS_RENDER else "Self-hosted (VPS / Docker)"
 APP_URL = (os.getenv("APP_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 KEEP_ALIVE = _bool("KEEP_ALIVE", default=bool(APP_URL))
 PING_INTERVAL = max(60, _int("PING_INTERVAL", 240))
